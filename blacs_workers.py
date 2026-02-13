@@ -40,6 +40,7 @@ class NI_DAQmxPhotonCounterWorker(Worker):
         # Ensure messages propagate to the parent BLACS logger
         self.logger.propagate = True
         self.logger.setLevel(logging.DEBUG)
+        self._stop_time = None
 
     def transition_to_buffered(self, device_name, h5file, initial_values, fresh):
         self.h5_file = h5file
@@ -82,16 +83,16 @@ class NI_DAQmxPhotonCounterWorker(Worker):
             # Use the onboard clock (empty string = internal timebase).
             clock_source = "100kHzTimebase"
         
-        # Use continuous acquisition so we don't hang if edge count
-        # doesn't exactly match expectations
+        num_samples = int(np.ceil(stop_time * sample_rate))
+
         self.task.CfgSampClkTiming(
             clock_source,
             float(sample_rate),
             DAQmx_Val_Rising,
-            DAQmx_Val_ContSamps,
+            DAQmx_Val_FiniteSamps,   # instead of DAQmx_Val_ContSamps
             num_samples
-        )
-        
+        )  
+
         self.task.StartTask()
         self.logger.info(
             f"Photon counter ARMED: counting on {self.photon_input_terminal}, "
@@ -120,10 +121,14 @@ class NI_DAQmxPhotonCounterWorker(Worker):
             # For continuous acquisition with internal clock, wait for
             # the expected duration plus a margin
             import time
-            # The pseudoclock doesn't gate us, so we time it ourselves
-            # (This is a simplification — see notes below)
-            time.sleep(self._stop_time + 0.1)
-            
+            timeout = self._stop_time * 2.0 + 5.0  # generous timeout
+            self.task.WaitUntilTaskDone(timeout)
+
+            available = uInt32()
+            self.task.GetReadAvailSampPerChan(available)
+            n = available.value
+            self.logger.info(f"Counter samples available: {n}")  
+
             # Read however many samples are available
             available = uInt32()
             self.task.GetReadAvailSampPerChan(available)
