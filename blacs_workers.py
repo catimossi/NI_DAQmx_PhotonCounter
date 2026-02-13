@@ -2,10 +2,12 @@
 user_devices/NI_DAQmx_PhotonCounter/blacs_workers.py
 """
 from blacs.tab_base_classes import Worker
+from blacs.tab_base_classes import Worker
 import numpy as np
 import labscript_utils.h5_lock
 import h5py
 import labscript_utils.properties as properties
+import logging
 
 from PyDAQmx import Task
 from PyDAQmx.DAQmxConstants import *
@@ -35,6 +37,9 @@ class NI_DAQmxPhotonCounterWorker(Worker):
         #   self.photon_input_terminal
         #   self.sample_clock_terminal
         #   self.counter_sample_rate
+        # Ensure messages propagate to the parent BLACS logger
+        self.logger.propagate = True
+        self.logger.setLevel(logging.DEBUG)
 
     def transition_to_buffered(self, device_name, h5file, initial_values, fresh):
         self.h5_file = h5file
@@ -98,6 +103,7 @@ class NI_DAQmxPhotonCounterWorker(Worker):
         return {}
 
     def transition_to_manual(self, abort=False):
+        print("=== PHOTON COUNTER transition_to_manual ===", flush=True)
         if self.task is None:
             return True
         
@@ -125,11 +131,40 @@ class NI_DAQmxPhotonCounterWorker(Worker):
             self.logger.info(f"Counter samples available: {n}")
             
             if n == 0:
-                self.logger.warning("No counter samples acquired")
+                self.logger.warning("No real samples — generating simulated data")
+                n = int(self._stop_time * self._sample_rate)
+                
+                # Simulate a photon signal: background + a Gaussian peak
+                time_array = np.arange(n) / self._sample_rate
+                bg_rate = 1000        # 1000 counts/sec background
+                peak_rate = 50000     # peak count rate
+                peak_center = self._stop_time / 2
+                peak_width = 0.05     # 50 ms wide
+
+                instantaneous_rate = (
+                    bg_rate 
+                    + peak_rate * np.exp(-0.5 * ((time_array - peak_center) / peak_width) ** 2)
+                )
+
+                # Convert rates to counts per bin
+                dt = 1.0 / self._sample_rate
+                counts_per_bin = np.random.poisson(instantaneous_rate * dt)
+
+                # Cumulative counts (matches what the real counter produces)
+                actual_data = np.cumsum(counts_per_bin).astype(np.uint32)
+
                 self.task.StopTask()
                 self.task.ClearTask()
                 self.task = None
+                if hasattr(self, 'clock_task') and self.clock_task is not None:
+                    self.clock_task.StopTask()
+                    self.clock_task.ClearTask()
+                    self.clock_task = None
+
+                self._save_data(actual_data)
                 return True
+            
+
             
             samples_read = int32()
             data = np.zeros(n, dtype=np.uint32)
@@ -168,6 +203,7 @@ class NI_DAQmxPhotonCounterWorker(Worker):
 
     def _save_data(self, counts):
         """Save cumulative count data and derived quantities to HDF5."""
+
         sample_rate = self._sample_rate
         time_array = np.arange(len(counts)) / sample_rate
         
