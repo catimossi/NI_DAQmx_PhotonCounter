@@ -50,7 +50,7 @@ class CCounter:
     FREQ OUT 1 (PFI 14) 
  
     """
-    def __init__(self, ctr='0', source = "100kHzTimebase", sample_rate = 100000, samples=100000,f_arm_trigger=False, f_pause_trigger=False, f_buffered=None):
+    def __init__(self, ctr='3', source = "100kHzTimebase", sample_rate = 100000, samples=100000,f_arm_trigger=False, f_pause_trigger=False, f_buffered=None):
         """
         Initialize counter task. Note CTR 3 (PFI 0) may be used for arm trigger.
         
@@ -90,7 +90,7 @@ class CCounter:
             # Unbuffered mode with pause trigger
             self.is_buffered = False
             self.task.SetPauseTrigType(DAQmx_Val_DigLvl)
-            self.task.SetDigLvlPauseTrigSrc(f"/{self.device}/PFI0")
+            self.task.SetDigLvlPauseTrigSrc(f"/{self.device}/PFI0") #CTR 2 A input
             self.task.SetDigLvlPauseTrigWhen(DAQmx_Val_Low)
         elif self.is_buffered:
             # Buffered mode with sample clock
@@ -105,7 +105,7 @@ class CCounter:
             if f_arm_trigger:
                 # Configure arm start trigger
                 self.task.SetArmStartTrigType(DAQmx_Val_DigEdge)
-                self.task.SetDigEdgeArmStartTrigSrc(f"/{self.device}/PFI0")
+                self.task.SetDigEdgeArmStartTrigSrc(f"/{self.device}/PFI0") # CTR 2 A 
                 self.task.SetDigEdgeArmStartTrigEdge(DAQmx_Val_Falling)
         # else: unbuffered, no triggers - no additional configuration needed
 
