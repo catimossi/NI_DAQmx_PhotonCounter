@@ -45,60 +45,57 @@ class NI_DAQmxPhotonCounterWorker(Worker):
     def transition_to_buffered(self, device_name, h5file, initial_values, fresh):
         self.h5_file = h5file
         self.device_name = device_name
-        
-        # Read stop_time from our own device group
+
         with h5py.File(h5file, 'r') as f:
             grp = f['devices'][device_name]
             stop_time = float(grp.attrs.get('stop_time', 1.0))
-        
+
         sample_rate = self.counter_sample_rate
-        # Buffer size: pad by 10% for safety
-        num_samples = int(np.ceil(stop_time * sample_rate * 1.1))
-        
+        num_samples = int(np.ceil(stop_time * sample_rate))
+
         self.logger.info(
             f"Photon counter: {stop_time:.3f}s, "
             f"buffer {num_samples} samples @ {sample_rate} Hz"
         )
-        
+
+        # 1. Create the task
         self.task = Task()
         counter_path = f"/{self.MAX_name}/{self.counter_channel}"
-        
-        # Create the edge-counting channel
+
+        # 2. Create the edge-counting channel
         self.task.CreateCICountEdgesChan(
             counter_path,
-            "",                     # name to assign
+            "",
             DAQmx_Val_Rising,
-            0,                      # initial count
+            0,
             DAQmx_Val_CountUp
         )
-        
-        # Explicitly set which terminal receives the photon pulses
+
+        # 3. Set photon input terminal
         self.task.SetCICountEdgesTerm(counter_path, self.photon_input_terminal)
-        
-        # Determine sample clock source
-        if self.sample_clock_terminal:
-            clock_source = self.sample_clock_terminal
-        else:
-            # With DummyPseudoclock there is no real hardware clock.
-            # Use the onboard clock (empty string = internal timebase).
-            clock_source = "100kHzTimebase"
-        
-        num_samples = int(np.ceil(stop_time * sample_rate))
 
+        # 4. Configure sample clock
         self.task.CfgSampClkTiming(
-            clock_source,
-            float(sample_rate),
+            f"/{self.MAX_name}/100kHzTimebase",
+            100000,                         # must be exactly 100000
             DAQmx_Val_Rising,
-            DAQmx_Val_FiniteSamps,   # instead of DAQmx_Val_ContSamps
+            DAQmx_Val_FiniteSamps,
             num_samples
-        )  
+        )
 
+        # 5. Configure start trigger (AFTER task and timing are set up)
+        if self.start_trigger_terminal:
+            self.task.SetArmStartTrigType(DAQmx_Val_DigEdge)
+            self.task.SetDigEdgeArmStartTrigSrc(self.start_trigger_terminal)
+            self.task.SetDigEdgeArmStartTrigEdge(DAQmx_Val_Rising)
+
+        # 6. Start the task
         self.task.StartTask()
         self.logger.info(
             f"Photon counter ARMED: counting on {self.photon_input_terminal}, "
-            f"clock={'internal' if not clock_source else clock_source}"
+            f"clock=OnboardClock, trigger={self.start_trigger_terminal or 'none'}"
         )
-        
+
         self._stop_time = stop_time
         self._sample_rate = sample_rate
         return {}

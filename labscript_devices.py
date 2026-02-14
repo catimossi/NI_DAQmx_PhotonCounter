@@ -20,7 +20,7 @@ class NI_DAQmxPhotonCounter(IntermediateDevice):
                 'photon_input_terminal',
                 'sample_clock_terminal',
                 'counter_sample_rate',
-            ],
+                'start_trigger_terminal',],
             'device_properties': [],
         }
     )
@@ -30,6 +30,7 @@ class NI_DAQmxPhotonCounter(IntermediateDevice):
                  photon_input_terminal='/PXI1Slot2/PFI0',
                  sample_clock_terminal=None,
                  counter_sample_rate=100000,
+                 start_trigger_terminal=None,   # <-- add this
                  **kwargs):
         IntermediateDevice.__init__(self, name, parent_device, **kwargs)
         self.BLACS_connection = MAX_name
