@@ -1,0 +1,1 @@
+Implement Labscript device support for using an NI PXIe 6363's counter as and edge counter to support a photo multiplier. The counter starts once the arm/start trigger is signaled and stores a 100000 counts at 100khz rate. The data is saved to an h5 file in the experiments directory in devices/traces/photon_counts as a float array of 10us time increments with 32 bit count values.
