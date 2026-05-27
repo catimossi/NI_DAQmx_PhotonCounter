@@ -48,14 +48,13 @@ class NI_DAQmxPhotonCounterWorker(Worker):
 
         with h5py.File(h5file, 'r') as f:
             grp = f['devices'][device_name]
-            stop_time = float(grp.attrs.get('stop_time', 1.0))
+            num_samples = int(grp.attrs['number_of_counts'])
 
         sample_rate = self.counter_sample_rate
-        num_samples = int(np.ceil(stop_time * sample_rate))
 
         self.logger.info(
-            f"Photon counter: {stop_time:.3f}s, "
-            f"buffer {num_samples} samples @ {sample_rate} Hz"
+            f"Photon counter: {num_samples} samples @ {sample_rate} Hz "
+            f"({num_samples / sample_rate:.3f}s)"
         )
 
         # 1. Create the task
@@ -75,9 +74,14 @@ class NI_DAQmxPhotonCounterWorker(Worker):
         self.task.SetCICountEdgesTerm(counter_path, self.photon_input_terminal)
 
         # 4. Configure sample clock
+        clock_source = (
+            self.sample_clock_terminal
+            if self.sample_clock_terminal
+            else f"/{self.MAX_name}/100kHzTimebase"
+        )
         self.task.CfgSampClkTiming(
-            f"/{self.MAX_name}/100kHzTimebase",
-            100000,                         # must be exactly 100000
+            clock_source,
+            sample_rate,
             DAQmx_Val_Rising,
             DAQmx_Val_FiniteSamps,
             num_samples
@@ -85,18 +89,16 @@ class NI_DAQmxPhotonCounterWorker(Worker):
 
         # 5. Configure start trigger (AFTER task and timing are set up)
         if self.start_trigger_terminal:
-            self.task.SetArmStartTrigType(DAQmx_Val_DigEdge)
-            self.task.SetDigEdgeArmStartTrigSrc(self.start_trigger_terminal)
-            self.task.SetDigEdgeArmStartTrigEdge(DAQmx_Val_Rising)
+            self.task.CfgDigEdgeStartTrig(self.start_trigger_terminal, DAQmx_Val_Rising)
 
-        # 6. Start the task
+        # 6. Start (arm) the task — waits for start trigger before counting begins
         self.task.StartTask()
         self.logger.info(
             f"Photon counter ARMED: counting on {self.photon_input_terminal}, "
-            f"clock=OnboardClock, trigger={self.start_trigger_terminal or 'none'}"
+            f"clock={clock_source}, start_trigger={self.start_trigger_terminal or 'none'}"
         )
 
-        self._stop_time = stop_time
+        self._stop_time = num_samples / sample_rate
         self._sample_rate = sample_rate
         return {}
 
