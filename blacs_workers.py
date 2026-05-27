@@ -121,10 +121,10 @@ class NI_DAQmxPhotonCounterWorker(Worker):
             timeout = self._stop_time * 2.0 + 5.0  # generous timeout
             self.task.WaitUntilTaskDone(timeout)
 
-            available = uInt32()
-            self.task.GetReadAvailSampPerChan(available)
-            n = available.value
-            self.logger.info(f"Counter samples available: {n}")  
+            # available = uInt32()
+            # self.task.GetReadAvailSampPerChan(available)
+            # n = available.value
+            # self.logger.info(f"Counter samples available: {n}")  
 
             # Read however many samples are available
             available = uInt32()
@@ -132,7 +132,7 @@ class NI_DAQmxPhotonCounterWorker(Worker):
             n = available.value
             self.logger.info(f"Counter samples available: {n}")
             
-            if n == 0:
+            if n == 0: #simulated data
                 self.logger.warning("No real samples — generating simulated data")
                 n = int(self._stop_time * self._sample_rate)
                 
@@ -166,8 +166,7 @@ class NI_DAQmxPhotonCounterWorker(Worker):
                 self._save_data(actual_data)
                 return True
             
-
-            
+         
             samples_read = int32()
             data = np.zeros(n, dtype=np.uint32)
             
@@ -216,6 +215,7 @@ class NI_DAQmxPhotonCounterWorker(Worker):
         trace['values'] = counts
         
         # Compute summary statistics
+        #TODO: maybe more useful to compute mininmum and maximum count rates instead of mean/std, since the rate is not constant?
         total_counts = int(counts[-1]) - int(counts[0]) if len(counts) > 1 else 0
         if len(counts) > 1:
             rates = np.diff(counts.astype(np.float64)) * sample_rate
