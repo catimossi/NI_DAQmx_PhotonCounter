@@ -41,6 +41,7 @@ class NI_DAQmxPhotonCounterWorker(Worker):
         self.logger.propagate = True
         self.logger.setLevel(logging.DEBUG)
         self._stop_time = None
+        self._total_samples = None
         self._skip_samples = 0
         self._num_samples = None
 
@@ -108,6 +109,7 @@ class NI_DAQmxPhotonCounterWorker(Worker):
 
         self._skip_samples = skip_samples
         self._num_samples = num_samples
+        self._total_samples = total_samples
         self._stop_time = total_samples / sample_rate
         self._sample_rate = sample_rate
         return {}
@@ -127,21 +129,31 @@ class NI_DAQmxPhotonCounterWorker(Worker):
             return True
         
         try:
-            # For continuous acquisition with internal clock, wait for
-            # the expected duration plus a margin
-            import time
-            timeout = self._stop_time * 2.0 + 5.0  # generous timeout
-            self.task.WaitUntilTaskDone(timeout)
+            # Wait for the finite acquisition to finish, but do not treat a DAQmx
+            # timeout as fatal: the task may have already produced the samples we
+            # need, especially when the start trigger arrives late or the clock
+            # is externally derived.
+            timeout = max((self._stop_time or 0.0) * 2.0 + 5.0, 10.0)
+            try:
+                self.task.WaitUntilTaskDone(timeout)
+            except Exception as wait_exc:
+                self.logger.warning(
+                    "WaitUntilTaskDone did not complete cleanly; continuing with available samples: %s",
+                    wait_exc,
+                )
 
-            # available = uInt32()
-            # self.task.GetReadAvailSampPerChan(available)
-            # n = available.value
-            # self.logger.info(f"Counter samples available: {n}")  
-
-            # Read however many samples are available
+            # Read however many samples are available. If the task is already
+            # stopped, fall back to the total acquired count for the channel.
             available = uInt32()
             self.task.GetReadAvailSampPerChan(available)
             n = available.value
+            if n == 0:
+                acquired = uInt32()
+                try:
+                    self.task.GetReadTotalSampPerChanAcquired(acquired)
+                    n = max(n, acquired.value)
+                except Exception:
+                    pass
             self.logger.info(f"Counter samples available: {n}")
             
             if n == 0: #simulated data
@@ -238,16 +250,18 @@ class NI_DAQmxPhotonCounterWorker(Worker):
         trace['t'] = time_array
         trace['values'] = counts
         
-        # Compute summary statistics
-        #TODO: maybe more useful to compute mininmum and maximum count rates instead of mean/std, since the rate is not constant?
+        # Compute summary statistics from the instantaneous count rate.
         total_counts = int(counts[-1]) - int(counts[0]) if len(counts) > 1 else 0
         if len(counts) > 1:
             rates = np.diff(counts.astype(np.float64)) * sample_rate
-            mean_rate = float(np.mean(rates))
-            std_rate = float(np.std(rates))
+            peak_rate = float(np.max(rates))
+            peak_index = int(np.argmax(rates))
+            peak_time = float(peak_index + 1) / sample_rate
         else:
-            mean_rate = 0.0
-            std_rate = 0.0
+            rates = np.zeros(0, dtype=np.float64)
+            peak_rate = 0.0
+            peak_index = 0
+            peak_time = 0.0
         
         with h5py.File(self.h5_file, 'a') as f:
             traces = f.require_group('data/traces')
@@ -255,12 +269,13 @@ class NI_DAQmxPhotonCounterWorker(Worker):
             
             results = f.require_group('results')
             results.attrs['photon_total_counts'] = total_counts
-            results.attrs['photon_mean_rate'] = mean_rate
-            results.attrs['photon_rate_std'] = std_rate
+            results.attrs['photon_peak_rate'] = peak_rate
+            results.attrs['photon_peak_time'] = peak_time
+            results.attrs['photon_peak_bin'] = peak_index
         
         self.logger.info(
             f"Saved: {total_counts} total counts, "
-            f"mean rate {mean_rate:.0f} ± {std_rate:.0f} c/s"
+            f"peak rate {peak_rate:.0f} c/s at t={peak_time:.6f}s (bin {peak_index})"
         )
 
     def abort_buffered(self):
