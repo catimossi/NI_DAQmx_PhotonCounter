@@ -1,7 +1,8 @@
 """
 user_devices/NI_DAQmx_PhotonCounter/labscript_devices.py
 """
-from labscript import IntermediateDevice, set_passed_properties
+import math
+from labscript import IntermediateDevice, LabscriptError, set_passed_properties
 
 
 class NI_DAQmxPhotonCounter(IntermediateDevice):
@@ -34,10 +35,44 @@ class NI_DAQmxPhotonCounter(IntermediateDevice):
                  **kwargs):
         IntermediateDevice.__init__(self, name, parent_device, **kwargs)
         self.BLACS_connection = MAX_name
+        self.counter_sample_rate = counter_sample_rate
+        self._acquisition = None  # set by acquire(); (t, number_of_counts) or None
 
-    def generate_code(self, hcdf5_file):
-        IntermediateDevice.generate_code(self, hcdf5_file)
-        # The parent's generate_code creates the group. Access it via
-        # the underlying h5py File object, not the wrapper.
-        grp = hcdf5_file['devices'].require_group(self.name)
+    def acquire(self, t, number_of_counts):
+        """Schedule a photon-counting acquisition.
+
+        Args:
+            t: Start time (seconds) in the labscript sequence. Stored in the
+               shot file for reference; hardware start is determined by
+               start_trigger_terminal.
+            number_of_counts: Number of samples to acquire at counter_sample_rate.
+               E.g. 50_000 at 100 kHz = 500 ms of data.
+        """
+        if self._acquisition is not None:
+            raise LabscriptError(
+                f"{self.name}: acquire() called twice in one shot. "
+                "Only one acquisition window per shot is supported."
+            )
+        if int(number_of_counts) <= 0:
+            raise LabscriptError(
+                f"{self.name}: number_of_counts must be positive, "
+                f"got {number_of_counts}."
+            )
+        self._acquisition = (t, int(number_of_counts))
+
+    # Alias: photon_counter.start(n) works identically to photon_counter.acquire(t, n)
+    start = acquire
+
+    def generate_code(self, hdf5_file):
+        IntermediateDevice.generate_code(self, hdf5_file)
+        grp = hdf5_file['devices'].require_group(self.name)
         grp.attrs['stop_time'] = self.pseudoclock_device.stop_time
+        if self._acquisition is not None:
+            t, number_of_counts = self._acquisition
+            grp.attrs['number_of_counts'] = number_of_counts
+            grp.attrs['t_start'] = t
+        else:
+            # Fallback: fill the whole shot at the configured sample rate
+            grp.attrs['number_of_counts'] = math.ceil(
+                self.pseudoclock_device.stop_time * self.counter_sample_rate
+            )

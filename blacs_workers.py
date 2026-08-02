@@ -41,6 +41,9 @@ class NI_DAQmxPhotonCounterWorker(Worker):
         self.logger.propagate = True
         self.logger.setLevel(logging.DEBUG)
         self._stop_time = None
+        self._total_samples = None
+        self._skip_samples = 0
+        self._num_samples = None
 
     def transition_to_buffered(self, device_name, h5file, initial_values, fresh):
         self.h5_file = h5file
@@ -48,14 +51,17 @@ class NI_DAQmxPhotonCounterWorker(Worker):
 
         with h5py.File(h5file, 'r') as f:
             grp = f['devices'][device_name]
-            stop_time = float(grp.attrs.get('stop_time', 1.0))
+            num_samples = int(grp.attrs['number_of_counts'])
+            t_start = float(grp.attrs.get('t_start', 0.0))
 
         sample_rate = self.counter_sample_rate
-        num_samples = int(np.ceil(stop_time * sample_rate))
+        skip_samples = round(t_start * sample_rate)
+        total_samples = skip_samples + num_samples
 
         self.logger.info(
-            f"Photon counter: {stop_time:.3f}s, "
-            f"buffer {num_samples} samples @ {sample_rate} Hz"
+            f"Photon counter: {skip_samples} skip + {num_samples} acquire = "
+            f"{total_samples} total samples @ {sample_rate} Hz "
+            f"(t_start={t_start:.3f}s, duration={num_samples / sample_rate:.3f}s)"
         )
 
         # 1. Create the task
@@ -75,28 +81,36 @@ class NI_DAQmxPhotonCounterWorker(Worker):
         self.task.SetCICountEdgesTerm(counter_path, self.photon_input_terminal)
 
         # 4. Configure sample clock
+        clock_source = (
+            self.sample_clock_terminal
+            if self.sample_clock_terminal
+            else f"/{self.MAX_name}/100kHzTimebase"
+        )
         self.task.CfgSampClkTiming(
-            f"/{self.MAX_name}/100kHzTimebase",
-            100000,                         # must be exactly 100000
+            clock_source,
+            sample_rate,
             DAQmx_Val_Rising,
             DAQmx_Val_FiniteSamps,
-            num_samples
+            total_samples
         )
 
-        # 5. Configure start trigger (AFTER task and timing are set up)
+        # 5. Configure arm-start trigger (CI tasks require ArmStartTrigger, not StartTrigger)
         if self.start_trigger_terminal:
             self.task.SetArmStartTrigType(DAQmx_Val_DigEdge)
             self.task.SetDigEdgeArmStartTrigSrc(self.start_trigger_terminal)
             self.task.SetDigEdgeArmStartTrigEdge(DAQmx_Val_Rising)
 
-        # 6. Start the task
+        # 6. Start (arm) the task — waits for start trigger before counting begins
         self.task.StartTask()
         self.logger.info(
             f"Photon counter ARMED: counting on {self.photon_input_terminal}, "
-            f"clock=OnboardClock, trigger={self.start_trigger_terminal or 'none'}"
+            f"clock={clock_source}, start_trigger={self.start_trigger_terminal or 'none'}"
         )
 
-        self._stop_time = stop_time
+        self._skip_samples = skip_samples
+        self._num_samples = num_samples
+        self._total_samples = total_samples
+        self._stop_time = total_samples / sample_rate
         self._sample_rate = sample_rate
         return {}
 
@@ -115,37 +129,49 @@ class NI_DAQmxPhotonCounterWorker(Worker):
             return True
         
         try:
-            # For continuous acquisition with internal clock, wait for
-            # the expected duration plus a margin
-            import time
-            timeout = self._stop_time * 2.0 + 5.0  # generous timeout
-            self.task.WaitUntilTaskDone(timeout)
+            # Wait for the finite acquisition to finish, but do not treat a DAQmx
+            # timeout as fatal: the task may have already produced the samples we
+            # need, especially when the start trigger arrives late or the clock
+            # is externally derived.
+            timeout = max((self._stop_time or 0.0) * 2.0 + 5.0, 10.0)
+            try:
+                self.task.WaitUntilTaskDone(timeout)
+            except Exception as wait_exc:
+                self.logger.warning(
+                    "WaitUntilTaskDone did not complete cleanly; continuing with available samples: %s",
+                    wait_exc,
+                )
 
-            # available = uInt32()
-            # self.task.GetReadAvailSampPerChan(available)
-            # n = available.value
-            # self.logger.info(f"Counter samples available: {n}")  
-
-            # Read however many samples are available
+            # Read however many samples are available. If the task is already
+            # stopped, fall back to the total acquired count for the channel.
             available = uInt32()
             self.task.GetReadAvailSampPerChan(available)
             n = available.value
+            if n == 0:
+                acquired = uInt32()
+                try:
+                    self.task.GetReadTotalSampPerChanAcquired(acquired)
+                    n = max(n, acquired.value)
+                except Exception:
+                    pass
             self.logger.info(f"Counter samples available: {n}")
             
             if n == 0: #simulated data
                 self.logger.warning("No real samples — generating simulated data")
-                n = int(self._stop_time * self._sample_rate)
+                total_n = int(self._stop_time * self._sample_rate)
                 
                 # Simulate a photon signal: background + a Gaussian peak
-                time_array = np.arange(n) / self._sample_rate
+                # Generate over the full (skip + acquire) window
+                time_array = np.arange(total_n) / self._sample_rate
                 bg_rate = 1000        # 1000 counts/sec background
                 peak_rate = 50000     # peak count rate
-                peak_center = self._stop_time / 2
+                # Peak is centred within the acquire window, not the full window
+                acquire_center = (self._skip_samples + self._num_samples / 2) / self._sample_rate
                 peak_width = 0.05     # 50 ms wide
 
                 instantaneous_rate = (
                     bg_rate 
-                    + peak_rate * np.exp(-0.5 * ((time_array - peak_center) / peak_width) ** 2)
+                    + peak_rate * np.exp(-0.5 * ((time_array - acquire_center) / peak_width) ** 2)
                 )
 
                 # Convert rates to counts per bin
@@ -153,7 +179,11 @@ class NI_DAQmxPhotonCounterWorker(Worker):
                 counts_per_bin = np.random.poisson(instantaneous_rate * dt)
 
                 # Cumulative counts (matches what the real counter produces)
-                actual_data = np.cumsum(counts_per_bin).astype(np.uint32)
+                cumulative = np.cumsum(counts_per_bin).astype(np.uint32)
+
+                # Slice the acquire window and normalize to start at 0
+                windowed = cumulative[self._skip_samples : self._skip_samples + self._num_samples]
+                actual_data = (windowed.astype(np.int64) - int(windowed[0])).astype(np.uint32)
 
                 self.task.StopTask()
                 self.task.ClearTask()
@@ -179,8 +209,14 @@ class NI_DAQmxPhotonCounterWorker(Worker):
                 None
             )
             
-            actual_data = data[:samples_read.value]
-            self.logger.info(f"Read {samples_read.value} counter samples")
+            raw = data[:samples_read.value]
+            # Slice the acquire window and normalize cumulative counts to start at 0
+            windowed = raw[self._skip_samples : self._skip_samples + self._num_samples]
+            actual_data = (windowed.astype(np.int64) - int(windowed[0])).astype(np.uint32)
+            self.logger.info(
+                f"Read {samples_read.value} total samples; "
+                f"kept {len(actual_data)} after skipping {self._skip_samples} samples"
+            )
             
             self.task.StopTask()
             self.task.ClearTask()
@@ -214,16 +250,18 @@ class NI_DAQmxPhotonCounterWorker(Worker):
         trace['t'] = time_array
         trace['values'] = counts
         
-        # Compute summary statistics
-        #TODO: maybe more useful to compute mininmum and maximum count rates instead of mean/std, since the rate is not constant?
+        # Compute summary statistics from the instantaneous count rate.
         total_counts = int(counts[-1]) - int(counts[0]) if len(counts) > 1 else 0
         if len(counts) > 1:
             rates = np.diff(counts.astype(np.float64)) * sample_rate
-            mean_rate = float(np.mean(rates))
-            std_rate = float(np.std(rates))
+            peak_rate = float(np.max(rates))
+            peak_index = int(np.argmax(rates))
+            peak_time = float(peak_index + 1) / sample_rate
         else:
-            mean_rate = 0.0
-            std_rate = 0.0
+            rates = np.zeros(0, dtype=np.float64)
+            peak_rate = 0.0
+            peak_index = 0
+            peak_time = 0.0
         
         with h5py.File(self.h5_file, 'a') as f:
             traces = f.require_group('data/traces')
@@ -231,12 +269,13 @@ class NI_DAQmxPhotonCounterWorker(Worker):
             
             results = f.require_group('results')
             results.attrs['photon_total_counts'] = total_counts
-            results.attrs['photon_mean_rate'] = mean_rate
-            results.attrs['photon_rate_std'] = std_rate
+            results.attrs['photon_peak_rate'] = peak_rate
+            results.attrs['photon_peak_time'] = peak_time
+            results.attrs['photon_peak_bin'] = peak_index
         
         self.logger.info(
             f"Saved: {total_counts} total counts, "
-            f"mean rate {mean_rate:.0f} ± {std_rate:.0f} c/s"
+            f"peak rate {peak_rate:.0f} c/s at t={peak_time:.6f}s (bin {peak_index})"
         )
 
     def abort_buffered(self):
